@@ -14,6 +14,7 @@
     "module": "ESNext",
     "moduleResolution": "node",
     "noImplicitReturns": true,
+    "resolveJsonModule": true,
     "skipLibCheck": true,
     "strict": true,
     "target": "ES2018",

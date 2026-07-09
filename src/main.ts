@@ -1,6 +1,7 @@
 import {
   AbstractInputSuggest,
   App,
+  Menu,
   Notice,
   Plugin,
   PluginSettingTab,
@@ -28,28 +29,41 @@ type WindowWithMoment = Window & {
 
 const CONFLICT_BEHAVIORS = {
   TIMESTAMP: "timestamp",
+  SEQUENCE: "sequence",
   SKIP: "skip",
   STOP: "stop",
 } as const;
 
 type ConflictBehavior = (typeof CONFLICT_BEHAVIORS)[keyof typeof CONFLICT_BEHAVIORS];
 
+const ARCHIVE_LOCATIONS = {
+  CURRENT_FOLDER_SUBFOLDER: "current-folder-subfolder",
+  SPECIFIED_FOLDER: "specified-folder",
+} as const;
+
+type ArchiveLocation = (typeof ARCHIVE_LOCATIONS)[keyof typeof ARCHIVE_LOCATIONS];
+
 interface MirrorArchiveSettings {
-  archiveRoot: string;
+  archiveLocation: ArchiveLocation;
+  archiveSubfolderName: string;
+  archiveFolderPath: string;
   conflictBehavior: ConflictBehavior;
   language: LanguageSetting;
   showRibbonIcon: boolean;
   showFileMenuItem: boolean;
-  allowFolderArchive: boolean;
-  useFileExplorerSelectionForHotkey: boolean;
-  showSelectedCountInMenu: boolean;
 }
+
+type RawMirrorArchiveSettings = Partial<MirrorArchiveSettings> & {
+  archiveRoot?: string;
+  allowFolderArchive?: boolean;
+  useFileExplorerSelectionForHotkey?: boolean;
+  showSelectedCountInMenu?: boolean;
+};
 
 type ArchiveTarget = TFile | TFolder;
 
 interface ArchiveResult {
   skipped: boolean;
-  targetPath?: string;
 }
 
 interface FileExplorerItemLike {
@@ -77,18 +91,21 @@ type TemplateValues = Record<string, number | string>;
 type FolderChooseHandler = (folderPath: string) => Promise<void> | void;
 
 const DEFAULT_SETTINGS: MirrorArchiveSettings = {
-  archiveRoot: "",
-  conflictBehavior: CONFLICT_BEHAVIORS.TIMESTAMP,
+  archiveLocation: ARCHIVE_LOCATIONS.SPECIFIED_FOLDER,
+  archiveSubfolderName: "",
+  archiveFolderPath: "",
+  conflictBehavior: CONFLICT_BEHAVIORS.SEQUENCE,
   language: LANGUAGE_OPTIONS.SYSTEM,
   showRibbonIcon: true,
   showFileMenuItem: true,
-  allowFolderArchive: true,
-  useFileExplorerSelectionForHotkey: true,
-  showSelectedCountInMenu: true,
 };
 
 function isConflictBehavior(value: unknown): value is ConflictBehavior {
   return Object.values(CONFLICT_BEHAVIORS).includes(value as ConflictBehavior);
+}
+
+function isArchiveLocation(value: unknown): value is ArchiveLocation {
+  return Object.values(ARCHIVE_LOCATIONS).includes(value as ArchiveLocation);
 }
 
 export default class MirrorArchivePlugin extends Plugin {
@@ -104,40 +121,36 @@ export default class MirrorArchivePlugin extends Plugin {
 
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu, target) => {
-        if (!this.settings.showFileMenuItem) {
-          return;
-        }
+        this.addArchiveMenuItem(menu, this.getContextTargets(target));
+      })
+    );
 
-        if (this.canArchive(target)) {
-          const targets = this.getContextTargets(target);
-          const label =
-            targets.length > 1 && this.settings.showSelectedCountInMenu
-              ? this.t("menu.archiveSelected", { count: targets.length })
-              : this.t("command.mirrorArchive");
-
-          menu.addItem((item) => {
-            item
-              .setTitle(label)
-              .setIcon("archive")
-              .onClick(() => this.archiveTargets(targets));
-          });
-        }
+    this.registerEvent(
+      this.app.workspace.on("files-menu", (menu, targets) => {
+        this.addArchiveMenuItem(menu, targets);
       })
     );
   }
 
   async loadSettings(): Promise<void> {
-    const loadedData = (await this.loadData()) as Partial<MirrorArchiveSettings> | null;
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
-    this.settings.archiveRoot = this.normalizeArchiveRoot(this.settings.archiveRoot);
+    const loadedData = ((await this.loadData()) ?? {}) as RawMirrorArchiveSettings;
+    const archiveFolderPath = loadedData.archiveFolderPath ?? loadedData.archiveRoot ?? DEFAULT_SETTINGS.archiveFolderPath;
 
-    if (!isConflictBehavior(this.settings.conflictBehavior)) {
-      this.settings.conflictBehavior = DEFAULT_SETTINGS.conflictBehavior;
-    }
-
-    if (!this.isSupportedLanguageSetting(this.settings.language)) {
-      this.settings.language = DEFAULT_SETTINGS.language;
-    }
+    this.settings = {
+      archiveLocation: isArchiveLocation(loadedData.archiveLocation)
+        ? loadedData.archiveLocation
+        : DEFAULT_SETTINGS.archiveLocation,
+      archiveSubfolderName: this.normalizeArchiveSubfolderName(
+        loadedData.archiveSubfolderName ?? DEFAULT_SETTINGS.archiveSubfolderName
+      ),
+      archiveFolderPath: this.normalizeArchiveFolderPath(archiveFolderPath),
+      conflictBehavior: isConflictBehavior(loadedData.conflictBehavior)
+        ? loadedData.conflictBehavior
+        : DEFAULT_SETTINGS.conflictBehavior,
+      language: this.isSupportedLanguageSetting(loadedData.language) ? loadedData.language : DEFAULT_SETTINGS.language,
+      showRibbonIcon: loadedData.showRibbonIcon ?? DEFAULT_SETTINGS.showRibbonIcon,
+      showFileMenuItem: loadedData.showFileMenuItem ?? DEFAULT_SETTINGS.showFileMenuItem,
+    };
   }
 
   async saveSettings(): Promise<void> {
@@ -162,17 +175,15 @@ export default class MirrorArchivePlugin extends Plugin {
   }
 
   async archiveActiveFile(): Promise<void> {
-    if (!this.hasArchiveRoot()) {
-      this.showMissingArchiveRootNotice();
+    if (!this.hasArchiveDestination()) {
+      this.showMissingArchiveDestinationNotice();
       return;
     }
 
-    if (this.settings.useFileExplorerSelectionForHotkey) {
-      const selectedTargets = this.getSelectedTargets({ focusedOnly: true });
-      if (selectedTargets.length > 0) {
-        await this.archiveTargets(selectedTargets);
-        return;
-      }
+    const selectedTargets = this.getSelectedTargets({ focusedOnly: true });
+    if (selectedTargets.length > 0) {
+      await this.archiveTargets(selectedTargets);
+      return;
     }
 
     const file = this.app.workspace.getActiveFile();
@@ -186,8 +197,8 @@ export default class MirrorArchivePlugin extends Plugin {
   }
 
   async archiveTargets(targets: unknown[]): Promise<void> {
-    if (!this.hasArchiveRoot()) {
-      this.showMissingArchiveRootNotice();
+    if (!this.hasArchiveDestination()) {
+      this.showMissingArchiveDestinationNotice();
       return;
     }
 
@@ -216,24 +227,16 @@ export default class MirrorArchivePlugin extends Plugin {
       } catch (error) {
         if (error instanceof ArchiveConflictError) {
           conflictCount += 1;
-
-          if (this.settings.conflictBehavior === CONFLICT_BEHAVIORS.STOP) {
-            stoppedOnConflict = true;
-            break;
-          }
-        } else {
-          console.error(error);
-          failures.push({ target, error });
+          stoppedOnConflict = true;
+          break;
         }
+
+        console.error(error);
+        failures.push({ target, error });
       }
     }
 
-    if (stoppedOnConflict || failures.length > 0) {
-      new Notice(this.getBatchSummary(successCount, skippedCount, conflictCount, failures.length, stoppedOnConflict));
-      return;
-    }
-
-    if (skippedCount > 0) {
+    if (stoppedOnConflict || failures.length > 0 || skippedCount > 0) {
       new Notice(this.getBatchSummary(successCount, skippedCount, conflictCount, failures.length, stoppedOnConflict));
     } else if (successCount === 1) {
       new Notice(this.t("notice.archivedOne"));
@@ -248,8 +251,7 @@ export default class MirrorArchivePlugin extends Plugin {
       throw new Error(this.t("error.cannotArchive", { path: targetPath }));
     }
 
-    const archiveRoot = this.getArchiveRoot();
-    const targetPath = await this.getAvailablePath(`${archiveRoot}/${target.path}`, target instanceof TFolder);
+    const targetPath = await this.getAvailablePath(this.getArchiveTargetPath(target), target instanceof TFolder);
 
     if (!targetPath) {
       return { skipped: true };
@@ -260,7 +262,7 @@ export default class MirrorArchivePlugin extends Plugin {
     await this.ensureFolder(targetFolder);
     await this.app.fileManager.renameFile(target, targetPath);
 
-    return { skipped: false, targetPath };
+    return { skipped: false };
   }
 
   getBatchSummary(
@@ -288,11 +290,17 @@ export default class MirrorArchivePlugin extends Plugin {
       parts.push(this.t("summary.failed", { count: failureCount }));
     }
 
-    const prefix = stoppedOnConflict ? this.t("summary.stopped") : this.t("summary.finished");
-    return this.t("summary.template", { prefix, parts: parts.join(this.t("summary.separator")) });
+    return this.t("summary.template", {
+      prefix: stoppedOnConflict ? this.t("summary.stopped") : this.t("summary.finished"),
+      parts: parts.join(this.t("summary.separator")),
+    });
   }
 
-  getContextTargets(target: ArchiveTarget): ArchiveTarget[] {
+  getContextTargets(target: unknown): ArchiveTarget[] {
+    if (!this.canArchive(target)) {
+      return [];
+    }
+
     const selectedTargets = this.getSelectedTargets();
     const selectedContainsTarget = selectedTargets.some((selectedTarget) => selectedTarget.path === target.path);
 
@@ -301,6 +309,32 @@ export default class MirrorArchivePlugin extends Plugin {
     }
 
     return this.normalizeTargets([target]);
+  }
+
+  addArchiveMenuItem(menu: Menu, targets: unknown[]): void {
+    if (!this.settings.showFileMenuItem) {
+      return;
+    }
+
+    const normalizedTargets = this.normalizeTargets(targets);
+
+    if (normalizedTargets.length === 0) {
+      return;
+    }
+
+    const label =
+      normalizedTargets.length > 1
+        ? this.t("menu.archiveSelected", { count: normalizedTargets.length })
+        : this.t("command.mirrorArchive");
+
+    menu.addItem((item) => {
+      item
+        .setTitle(label)
+        .setIcon("archive")
+        .onClick(() => {
+          void this.archiveTargets(normalizedTargets);
+        });
+    });
   }
 
   getSelectedTargets(options: SelectedTargetOptions = {}): ArchiveTarget[] {
@@ -422,7 +456,7 @@ export default class MirrorArchivePlugin extends Plugin {
   }
 
   canArchive(target: unknown): target is ArchiveTarget {
-    const isArchiveableType = target instanceof TFile || (this.settings.allowFolderArchive && target instanceof TFolder);
+    const isArchiveableType = target instanceof TFile || target instanceof TFolder;
     return isArchiveableType && Boolean(target.path) && !this.isArchived(target);
   }
 
@@ -431,8 +465,19 @@ export default class MirrorArchivePlugin extends Plugin {
   }
 
   isArchived(target: ArchiveTarget): boolean {
-    const archiveRoot = this.getArchiveRoot();
-    return target.path === archiveRoot || target.path.startsWith(`${archiveRoot}/`);
+    if (this.settings.archiveLocation === ARCHIVE_LOCATIONS.CURRENT_FOLDER_SUBFOLDER) {
+      const archiveSubfolderName = this.getArchiveSubfolderName();
+      if (!archiveSubfolderName) return false;
+
+      const pathParts = target.path.split("/");
+      const parentParts = pathParts.slice(0, -1);
+      const targetName = pathParts[pathParts.length - 1];
+
+      return (target instanceof TFolder && targetName === archiveSubfolderName) || parentParts.includes(archiveSubfolderName);
+    }
+
+    const archiveFolderPath = this.getArchiveFolderPath();
+    return target.path === archiveFolderPath || target.path.startsWith(`${archiveFolderPath}/`);
   }
 
   async ensureFolder(folderPath: string): Promise<void> {
@@ -469,6 +514,10 @@ export default class MirrorArchivePlugin extends Plugin {
       throw new ArchiveConflictError(path);
     }
 
+    if (this.settings.conflictBehavior === CONFLICT_BEHAVIORS.SEQUENCE) {
+      return this.getAvailableSequencePath(path, isFolder);
+    }
+
     const stamp = this.getTimestamp();
     const stampedPath = this.addSuffix(path, stamp, isFolder);
 
@@ -482,6 +531,15 @@ export default class MirrorArchivePlugin extends Plugin {
     }
 
     return this.addSuffix(path, `${stamp}-${index}`, isFolder);
+  }
+
+  getAvailableSequencePath(path: string, isFolder = false): string {
+    let index = 1;
+    while (this.app.vault.getAbstractFileByPath(this.addSequenceSuffix(path, index, isFolder))) {
+      index += 1;
+    }
+
+    return this.addSequenceSuffix(path, index, isFolder);
   }
 
   getFolderPath(path: string): string {
@@ -504,6 +562,23 @@ export default class MirrorArchivePlugin extends Plugin {
     return `${path}-${suffix}`;
   }
 
+  addSequenceSuffix(path: string, index: number, isFolder: boolean): string {
+    const suffix = ` ${index}`;
+
+    if (isFolder) {
+      return `${path}${suffix}`;
+    }
+
+    const slashIndex = path.lastIndexOf("/");
+    const dotIndex = path.lastIndexOf(".");
+
+    if (dotIndex > slashIndex) {
+      return `${path.slice(0, dotIndex)}${suffix}${path.slice(dotIndex)}`;
+    }
+
+    return `${path}${suffix}`;
+  }
+
   getTimestamp(): string {
     const activeMoment = (activeWindow as WindowWithMoment).moment;
 
@@ -514,19 +589,36 @@ export default class MirrorArchivePlugin extends Plugin {
     return new Date().toISOString().replace(/[-:T.Z]/g, "").slice(0, 14);
   }
 
-  getArchiveRoot(): string {
-    return this.normalizeArchiveRoot(this.settings.archiveRoot);
+  getArchiveTargetPath(target: ArchiveTarget): string {
+    if (this.settings.archiveLocation === ARCHIVE_LOCATIONS.CURRENT_FOLDER_SUBFOLDER) {
+      const parentPath = this.getFolderPath(target.path);
+      return normalizePath([parentPath, this.getArchiveSubfolderName(), target.name].filter(Boolean).join("/"));
+    }
+
+    return normalizePath(`${this.getArchiveFolderPath()}/${target.path}`);
   }
 
-  hasArchiveRoot(): boolean {
-    return this.getArchiveRoot().length > 0;
+  getArchiveFolderPath(): string {
+    return this.normalizeArchiveFolderPath(this.settings.archiveFolderPath);
   }
 
-  showMissingArchiveRootNotice(): void {
+  getArchiveSubfolderName(): string {
+    return this.normalizeArchiveSubfolderName(this.settings.archiveSubfolderName);
+  }
+
+  hasArchiveDestination(): boolean {
+    if (this.settings.archiveLocation === ARCHIVE_LOCATIONS.CURRENT_FOLDER_SUBFOLDER) {
+      return this.getArchiveSubfolderName().length > 0;
+    }
+
+    return this.getArchiveFolderPath().length > 0;
+  }
+
+  showMissingArchiveDestinationNotice(): void {
     new Notice(this.t("notice.missingArchiveRoot"));
   }
 
-  normalizeArchiveRoot(value: unknown): string {
+  normalizeArchiveFolderPath(value: unknown): string {
     const rawValue = String(value ?? "").trim();
 
     if (!rawValue) {
@@ -540,6 +632,22 @@ export default class MirrorArchivePlugin extends Plugin {
     }
 
     return normalized.replace(/^\/+/, "").replace(/\/+$/, "");
+  }
+
+  normalizeArchiveSubfolderName(value: unknown): string {
+    const rawValue = String(value ?? "").trim();
+
+    if (!rawValue) {
+      return "";
+    }
+
+    const normalized = normalizePath(rawValue).replace(/^\/+/, "").replace(/\/+$/, "");
+
+    if (!normalized || normalized === "/" || normalized === ".") {
+      return "";
+    }
+
+    return normalized.split("/").filter(Boolean).join("-");
   }
 
   t(key: TranslationKey, values: TemplateValues = {}): string {
@@ -615,31 +723,69 @@ class MirrorArchiveSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName(t("settings.archiveRoot.name"))
-      .setDesc(t("settings.archiveRoot.desc"))
-      .addText((text) => {
-        text
-          .setPlaceholder(t("settings.archiveRoot.placeholder"))
-          .setValue(this.plugin.settings.archiveRoot)
+      .setName(t("settings.archiveLocation.name"))
+      .setDesc(t("settings.archiveLocation.desc"))
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption(ARCHIVE_LOCATIONS.CURRENT_FOLDER_SUBFOLDER, t("settings.archiveLocation.currentFolderSubfolder"))
+          .addOption(ARCHIVE_LOCATIONS.SPECIFIED_FOLDER, t("settings.archiveLocation.specifiedFolder"))
+          .setValue(this.plugin.settings.archiveLocation)
           .onChange(async (value) => {
-            this.plugin.settings.archiveRoot = this.plugin.normalizeArchiveRoot(value);
-            await this.plugin.saveSettings();
-          });
-
-        new FolderSuggest(this.app, text.inputEl, async (folderPath) => {
-          this.plugin.settings.archiveRoot = this.plugin.normalizeArchiveRoot(folderPath);
-          text.setValue(this.plugin.settings.archiveRoot);
-          await this.plugin.saveSettings();
-        });
-      })
-      .addExtraButton((button) =>
-        button
-          .setIcon("rotate-ccw")
-          .setTooltip(t("settings.archiveRoot.clear"))
-          .onClick(async () => {
-            this.plugin.settings.archiveRoot = DEFAULT_SETTINGS.archiveRoot;
+            this.plugin.settings.archiveLocation = isArchiveLocation(value) ? value : DEFAULT_SETTINGS.archiveLocation;
             await this.plugin.saveSettings();
             this.display();
+          })
+      );
+
+    if (this.plugin.settings.archiveLocation === ARCHIVE_LOCATIONS.CURRENT_FOLDER_SUBFOLDER) {
+      new Setting(containerEl)
+        .setName(t("settings.archiveSubfolderName.name"))
+        .setDesc(t("settings.archiveSubfolderName.desc"))
+        .addText((text) =>
+          text
+            .setPlaceholder(t("settings.archiveSubfolderName.placeholder"))
+            .setValue(this.plugin.settings.archiveSubfolderName)
+            .onChange(async (value) => {
+              this.plugin.settings.archiveSubfolderName = this.plugin.normalizeArchiveSubfolderName(value);
+              await this.plugin.saveSettings();
+            })
+        );
+    }
+
+    if (this.plugin.settings.archiveLocation === ARCHIVE_LOCATIONS.SPECIFIED_FOLDER) {
+      new Setting(containerEl)
+        .setName(t("settings.archiveFolderPath.name"))
+        .setDesc(t("settings.archiveFolderPath.desc"))
+        .addText((text) => {
+          text
+            .setPlaceholder(t("settings.archiveFolderPath.placeholder"))
+            .setValue(this.plugin.settings.archiveFolderPath)
+            .onChange(async (value) => {
+              this.plugin.settings.archiveFolderPath = this.plugin.normalizeArchiveFolderPath(value);
+              await this.plugin.saveSettings();
+            });
+
+          new FolderSuggest(this.app, text.inputEl, async (folderPath) => {
+            this.plugin.settings.archiveFolderPath = this.plugin.normalizeArchiveFolderPath(folderPath);
+            text.setValue(this.plugin.settings.archiveFolderPath);
+            await this.plugin.saveSettings();
+          });
+        });
+    }
+
+    new Setting(containerEl)
+      .setName(t("settings.conflict.name"))
+      .setDesc(t("settings.conflict.desc"))
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption(CONFLICT_BEHAVIORS.SEQUENCE, t("settings.conflict.sequence"))
+          .addOption(CONFLICT_BEHAVIORS.TIMESTAMP, t("settings.conflict.timestamp"))
+          .addOption(CONFLICT_BEHAVIORS.SKIP, t("settings.conflict.skip"))
+          .addOption(CONFLICT_BEHAVIORS.STOP, t("settings.conflict.stop"))
+          .setValue(this.plugin.settings.conflictBehavior)
+          .onChange(async (value) => {
+            this.plugin.settings.conflictBehavior = isConflictBehavior(value) ? value : DEFAULT_SETTINGS.conflictBehavior;
+            await this.plugin.saveSettings();
           })
       );
 
@@ -655,56 +801,11 @@ class MirrorArchiveSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName(t("settings.conflict.name"))
-      .setDesc(t("settings.conflict.desc"))
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption(CONFLICT_BEHAVIORS.TIMESTAMP, t("settings.conflict.timestamp"))
-          .addOption(CONFLICT_BEHAVIORS.SKIP, t("settings.conflict.skip"))
-          .addOption(CONFLICT_BEHAVIORS.STOP, t("settings.conflict.stop"))
-          .setValue(this.plugin.settings.conflictBehavior)
-          .onChange(async (value) => {
-            this.plugin.settings.conflictBehavior = isConflictBehavior(value) ? value : DEFAULT_SETTINGS.conflictBehavior;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
       .setName(t("settings.fileMenu.name"))
       .setDesc(t("settings.fileMenu.desc"))
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.showFileMenuItem).onChange(async (value) => {
           this.plugin.settings.showFileMenuItem = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName(t("settings.folderArchive.name"))
-      .setDesc(t("settings.folderArchive.desc"))
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.allowFolderArchive).onChange(async (value) => {
-          this.plugin.settings.allowFolderArchive = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName(t("settings.hotkeySelection.name"))
-      .setDesc(t("settings.hotkeySelection.desc"))
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.useFileExplorerSelectionForHotkey).onChange(async (value) => {
-          this.plugin.settings.useFileExplorerSelectionForHotkey = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(containerEl)
-      .setName(t("settings.selectedCount.name"))
-      .setDesc(t("settings.selectedCount.desc"))
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.showSelectedCountInMenu).onChange(async (value) => {
-          this.plugin.settings.showSelectedCountInMenu = value;
           await this.plugin.saveSettings();
         })
       );

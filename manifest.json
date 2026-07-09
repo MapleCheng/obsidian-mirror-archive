@@ -3,7 +3,7 @@
   "name": "Mirror Archive",
   "version": "1.0.1",
   "minAppVersion": "1.5.0",
-  "description": "Move selected files and folders to a configurable mirror archive root while preserving their original vault path.",
+  "description": "Move selected files and folders to a configurable archive location while preserving their original paths.",
   "author": "MapleCheng",
   "isDesktopOnly": false
 }

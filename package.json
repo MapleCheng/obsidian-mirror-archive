@@ -1,7 +1,7 @@
 {
   "name": "obsidian-mirror-archive",
   "version": "1.0.1",
-  "description": "Move selected files and folders to a configurable mirror archive root while preserving their original vault path.",
+  "description": "Move selected files and folders to a configurable archive location while preserving their original paths.",
   "main": "dist/main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
