@@ -6,7 +6,10 @@ on:
       - "*"
 
 permissions:
+  attestations: write
   contents: write
+  id-token: write
+  artifact-metadata: write
 
 jobs:
   release:
@@ -67,6 +70,14 @@ jobs:
           else
             echo "exists=false" >> "${GITHUB_OUTPUT}"
           fi
+
+      - name: Attest release assets
+        if: steps.existing-release.outputs.exists == 'false'
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/main.js
+            dist/manifest.json
 
       - name: Create GitHub release
         if: steps.existing-release.outputs.exists == 'false'

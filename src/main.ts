@@ -18,12 +18,12 @@ import {
   TranslationKey,
 } from "./i18n";
 
-type MomentGlobal = (() => { format(format: string): string }) & {
+type WindowMoment = (() => { format(format: string): string }) & {
   locale?: () => string;
 };
 
-type GlobalWithMoment = typeof globalThis & {
-  moment?: MomentGlobal;
+type WindowWithMoment = Window & {
+  moment?: WindowMoment;
 };
 
 const CONFLICT_BEHAVIORS = {
@@ -145,11 +145,8 @@ export default class MirrorArchivePlugin extends Plugin {
   }
 
   registerCommands(): void {
-    const removablePlugin = this as Plugin & { removeCommand?: (id: string) => void };
-    removablePlugin.removeCommand?.("mirror-archive-active-file");
-
     this.addCommand({
-      id: "mirror-archive-active-file",
+      id: "active-file",
       name: this.t("command.mirrorArchive"),
       callback: () => this.archiveActiveFile(),
     });
@@ -392,12 +389,6 @@ export default class MirrorArchivePlugin extends Plugin {
   }
 
   isFocusedView(view: FileExplorerViewLike): boolean {
-    const activeLeaf = this.app.workspace.activeLeaf as ({ view?: unknown } & object) | null;
-
-    if (activeLeaf?.view === view || view.leaf === activeLeaf) {
-      return true;
-    }
-
     const root = view.containerEl ?? view.contentEl;
     const activeElement = root?.ownerDocument.activeElement;
 
@@ -514,10 +505,10 @@ export default class MirrorArchivePlugin extends Plugin {
   }
 
   getTimestamp(): string {
-    const moment = (globalThis as GlobalWithMoment).moment;
+    const activeMoment = (activeWindow as WindowWithMoment).moment;
 
-    if (moment) {
-      return moment().format("YYYYMMDD-HHmmss");
+    if (activeMoment) {
+      return activeMoment().format("YYYYMMDD-HHmmss");
     }
 
     return new Date().toISOString().replace(/[-:T.Z]/g, "").slice(0, 14);
@@ -575,12 +566,12 @@ export default class MirrorArchivePlugin extends Plugin {
 
   getSystemLocale(): string {
     const vaultWithConfig = this.app.vault as typeof this.app.vault & { getConfig?: (key: string) => unknown };
-    const moment = (globalThis as GlobalWithMoment).moment;
+    const { moment: activeMoment, navigator } = activeWindow as WindowWithMoment;
     const candidates = [
       vaultWithConfig.getConfig?.("locale"),
-      moment?.locale?.(),
-      globalThis.navigator?.language,
-      ...(globalThis.navigator?.languages ?? []),
+      activeMoment?.locale?.(),
+      navigator?.language,
+      ...(navigator?.languages ?? []),
     ];
 
     return String(candidates.find(Boolean) ?? LANGUAGE_OPTIONS.EN).toLowerCase();
@@ -618,7 +609,6 @@ class MirrorArchiveSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.language = this.plugin.isSupportedLanguageSetting(value) ? value : DEFAULT_SETTINGS.language;
             await this.plugin.saveSettings();
-            this.plugin.registerCommands();
             this.plugin.updateRibbonIcon();
             this.display();
           })
