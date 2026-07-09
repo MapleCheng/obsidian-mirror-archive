@@ -1,0 +1,9 @@
+{
+  "id": "mirror-archive",
+  "name": "Mirror Archive",
+  "version": "1.0.0",
+  "minAppVersion": "1.5.0",
+  "description": "Move selected files and folders to a configurable mirror archive root while preserving their original vault path.",
+  "author": "MapleCheng",
+  "isDesktopOnly": false
+}
