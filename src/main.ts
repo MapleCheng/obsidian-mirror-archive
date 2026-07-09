@@ -61,6 +61,8 @@ type RawMirrorArchiveSettings = Partial<MirrorArchiveSettings> & {
 };
 
 type ArchiveTarget = TFile | TFolder;
+type TargetAction = "archive" | "restore";
+type TargetActionResolution = TargetAction | "mixed";
 
 interface ArchiveResult {
   skipped: boolean;
@@ -121,13 +123,13 @@ export default class MirrorArchivePlugin extends Plugin {
 
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu, target) => {
-        this.addArchiveMenuItem(menu, this.getContextTargets(target));
+        this.addActionMenuItem(menu, this.getContextTargets(target));
       })
     );
 
     this.registerEvent(
       this.app.workspace.on("files-menu", (menu, targets) => {
-        this.addArchiveMenuItem(menu, targets);
+        this.addActionMenuItem(menu, targets);
       })
     );
   }
@@ -161,7 +163,7 @@ export default class MirrorArchivePlugin extends Plugin {
     this.addCommand({
       id: "active-file",
       name: this.t("command.mirrorArchive"),
-      callback: () => this.archiveActiveFile(),
+      callback: () => this.runActiveAction(),
     });
   }
 
@@ -170,11 +172,11 @@ export default class MirrorArchivePlugin extends Plugin {
     this.ribbonIconEl = null;
 
     if (this.settings.showRibbonIcon) {
-      this.ribbonIconEl = this.addRibbonIcon("archive", this.t("command.mirrorArchive"), () => this.archiveActiveFile());
+      this.ribbonIconEl = this.addRibbonIcon("archive", this.t("command.mirrorArchive"), () => this.runActiveAction());
     }
   }
 
-  async archiveActiveFile(): Promise<void> {
+  async runActiveAction(): Promise<void> {
     if (!this.hasArchiveDestination()) {
       this.showMissingArchiveDestinationNotice();
       return;
@@ -182,7 +184,7 @@ export default class MirrorArchivePlugin extends Plugin {
 
     const selectedTargets = this.getSelectedTargets({ focusedOnly: true });
     if (selectedTargets.length > 0) {
-      await this.archiveTargets(selectedTargets);
+      await this.handleTargets(selectedTargets);
       return;
     }
 
@@ -193,7 +195,40 @@ export default class MirrorArchivePlugin extends Plugin {
       return;
     }
 
-    await this.archiveTargets([file]);
+    await this.handleTargets([file]);
+  }
+
+  async handleTargets(targets: unknown[]): Promise<void> {
+    if (!this.hasArchiveDestination()) {
+      this.showMissingArchiveDestinationNotice();
+      return;
+    }
+
+    const normalizedTargets = this.normalizeTargets(targets);
+
+    if (normalizedTargets.length === 0) {
+      new Notice(this.t("notice.noTargets"));
+      return;
+    }
+
+    const action = this.getTargetsAction(normalizedTargets);
+
+    if (action === "mixed") {
+      new Notice(this.t("notice.mixedTargets"));
+      return;
+    }
+
+    if (!action) {
+      new Notice(this.t("notice.noTargets"));
+      return;
+    }
+
+    if (action === "restore") {
+      await this.restoreTargets(normalizedTargets);
+      return;
+    }
+
+    await this.archiveTargets(normalizedTargets);
   }
 
   async archiveTargets(targets: unknown[]): Promise<void> {
@@ -237,7 +272,7 @@ export default class MirrorArchivePlugin extends Plugin {
     }
 
     if (stoppedOnConflict || failures.length > 0 || skippedCount > 0) {
-      new Notice(this.getBatchSummary(successCount, skippedCount, conflictCount, failures.length, stoppedOnConflict));
+      new Notice(this.getBatchSummary("archive", successCount, skippedCount, conflictCount, failures.length, stoppedOnConflict));
     } else if (successCount === 1) {
       new Notice(this.t("notice.archivedOne"));
     } else {
@@ -265,7 +300,79 @@ export default class MirrorArchivePlugin extends Plugin {
     return { skipped: false };
   }
 
+  async restoreTargets(targets: unknown[]): Promise<void> {
+    if (!this.hasArchiveDestination()) {
+      this.showMissingArchiveDestinationNotice();
+      return;
+    }
+
+    const normalizedTargets = this.normalizeTargets(targets);
+
+    if (normalizedTargets.length === 0) {
+      new Notice(this.t("notice.noTargets"));
+      return;
+    }
+
+    let successCount = 0;
+    let skippedCount = 0;
+    let conflictCount = 0;
+    const failures: Array<{ target: ArchiveTarget; error: unknown }> = [];
+    let stoppedOnConflict = false;
+
+    for (const target of normalizedTargets) {
+      try {
+        const result = await this.restoreTarget(target);
+
+        if (result.skipped) {
+          skippedCount += 1;
+        } else {
+          successCount += 1;
+        }
+      } catch (error) {
+        if (error instanceof ArchiveConflictError) {
+          conflictCount += 1;
+          stoppedOnConflict = true;
+          break;
+        }
+
+        console.error(error);
+        failures.push({ target, error });
+      }
+    }
+
+    if (stoppedOnConflict || failures.length > 0 || skippedCount > 0) {
+      new Notice(this.getBatchSummary("restore", successCount, skippedCount, conflictCount, failures.length, stoppedOnConflict));
+    } else if (successCount === 1) {
+      new Notice(this.t("notice.restoredOne"));
+    } else {
+      new Notice(this.t("notice.restoredMany", { count: successCount }));
+    }
+  }
+
+  async restoreTarget(target: ArchiveTarget): Promise<ArchiveResult> {
+    const restorePath = this.getRestoreTargetPath(target);
+
+    if (!restorePath) {
+      const targetPath = (target as TAbstractFile | null | undefined)?.path ?? "unknown item";
+      throw new Error(this.t("error.cannotRestore", { path: targetPath }));
+    }
+
+    const targetPath = await this.getAvailablePath(restorePath, target instanceof TFolder);
+
+    if (!targetPath) {
+      return { skipped: true };
+    }
+
+    const targetFolder = this.getFolderPath(targetPath);
+
+    await this.ensureFolder(targetFolder);
+    await this.app.fileManager.renameFile(target, targetPath);
+
+    return { skipped: false };
+  }
+
   getBatchSummary(
+    action: TargetAction,
     successCount: number,
     skippedCount: number,
     conflictCount: number,
@@ -273,9 +380,12 @@ export default class MirrorArchivePlugin extends Plugin {
     stoppedOnConflict: boolean
   ): string {
     const parts: string[] = [];
+    const successKey = action === "restore" ? "summary.restored" : "summary.archived";
+    const finishedKey = action === "restore" ? "summary.restoreFinished" : "summary.finished";
+    const stoppedKey = action === "restore" ? "summary.restoreStopped" : "summary.stopped";
 
     if (successCount > 0) {
-      parts.push(this.t("summary.archived", { count: successCount }));
+      parts.push(this.t(successKey, { count: successCount }));
     }
 
     if (skippedCount > 0) {
@@ -291,13 +401,13 @@ export default class MirrorArchivePlugin extends Plugin {
     }
 
     return this.t("summary.template", {
-      prefix: stoppedOnConflict ? this.t("summary.stopped") : this.t("summary.finished"),
+      prefix: stoppedOnConflict ? this.t(stoppedKey) : this.t(finishedKey),
       parts: parts.join(this.t("summary.separator")),
     });
   }
 
   getContextTargets(target: unknown): ArchiveTarget[] {
-    if (!this.canArchive(target)) {
+    if (!this.canHandle(target)) {
       return [];
     }
 
@@ -311,7 +421,7 @@ export default class MirrorArchivePlugin extends Plugin {
     return this.normalizeTargets([target]);
   }
 
-  addArchiveMenuItem(menu: Menu, targets: unknown[]): void {
+  addActionMenuItem(menu: Menu, targets: unknown[]): void {
     if (!this.settings.showFileMenuItem) {
       return;
     }
@@ -322,19 +432,25 @@ export default class MirrorArchivePlugin extends Plugin {
       return;
     }
 
-    const label =
-      normalizedTargets.length > 1
-        ? this.t("menu.archiveSelected", { count: normalizedTargets.length })
-        : this.t("command.mirrorArchive");
+    const action = this.getTargetsAction(normalizedTargets);
+    const label = this.getMenuLabel(action, normalizedTargets.length);
 
     menu.addItem((item) => {
       item
         .setTitle(label)
         .setIcon("archive")
         .onClick(() => {
-          void this.archiveTargets(normalizedTargets);
+          void this.handleTargets(normalizedTargets);
         });
     });
+  }
+
+  getMenuLabel(action: TargetActionResolution | null, count: number): string {
+    if (action === "restore") {
+      return count > 1 ? this.t("menu.restoreSelected", { count }) : this.t("command.restoreArchive");
+    }
+
+    return count > 1 ? this.t("menu.archiveSelected", { count }) : this.t("command.mirrorArchive");
   }
 
   getSelectedTargets(options: SelectedTargetOptions = {}): ArchiveTarget[] {
@@ -370,7 +486,7 @@ export default class MirrorArchivePlugin extends Plugin {
     const selectedTargets: ArchiveTarget[] = [];
 
     for (const item of Object.values(fileItems)) {
-      if (this.isSelectedFileExplorerItem(item) && this.canArchive(item.file)) {
+      if (this.isSelectedFileExplorerItem(item) && this.canHandle(item.file)) {
         selectedTargets.push(item.file);
       }
     }
@@ -392,7 +508,7 @@ export default class MirrorArchivePlugin extends Plugin {
       if (!path) continue;
 
       const target = this.app.vault.getAbstractFileByPath(path);
-      if (this.canArchive(target)) {
+      if (this.canHandle(target)) {
         selectedTargets.push(target);
       }
     }
@@ -437,7 +553,7 @@ export default class MirrorArchivePlugin extends Plugin {
     const targetsByPath = new Map<string, ArchiveTarget>();
 
     for (const target of targets) {
-      if (this.canArchive(target)) {
+      if (this.canHandle(target)) {
         targetsByPath.set(target.path, target);
       }
     }
@@ -455,9 +571,44 @@ export default class MirrorArchivePlugin extends Plugin {
     return topLevelTargets;
   }
 
+  getTargetsAction(targets: ArchiveTarget[]): TargetActionResolution | null {
+    let hasArchiveTargets = false;
+    let hasRestoreTargets = false;
+
+    for (const target of targets) {
+      if (this.canRestore(target)) {
+        hasRestoreTargets = true;
+      } else if (this.canArchive(target)) {
+        hasArchiveTargets = true;
+      }
+
+      if (hasArchiveTargets && hasRestoreTargets) {
+        return "mixed";
+      }
+    }
+
+    if (hasRestoreTargets) {
+      return "restore";
+    }
+
+    if (hasArchiveTargets) {
+      return "archive";
+    }
+
+    return null;
+  }
+
+  canHandle(target: unknown): target is ArchiveTarget {
+    return this.canArchive(target) || this.canRestore(target);
+  }
+
   canArchive(target: unknown): target is ArchiveTarget {
     const isArchiveableType = target instanceof TFile || target instanceof TFolder;
     return isArchiveableType && Boolean(target.path) && !this.isArchived(target);
+  }
+
+  canRestore(target: unknown): target is ArchiveTarget {
+    return (target instanceof TFile || target instanceof TFolder) && Boolean(target.path) && Boolean(this.getRestoreTargetPath(target));
   }
 
   isAncestorPath(parentPath: string, childPath: string): boolean {
@@ -591,11 +742,85 @@ export default class MirrorArchivePlugin extends Plugin {
 
   getArchiveTargetPath(target: ArchiveTarget): string {
     if (this.settings.archiveLocation === ARCHIVE_LOCATIONS.CURRENT_FOLDER_SUBFOLDER) {
-      const parentPath = this.getFolderPath(target.path);
-      return normalizePath([parentPath, this.getArchiveSubfolderName(), target.name].filter(Boolean).join("/"));
+      return this.getCurrentFolderSubfolderArchivePath(target);
     }
 
     return normalizePath(`${this.getArchiveFolderPath()}/${target.path}`);
+  }
+
+  getCurrentFolderSubfolderArchivePath(target: ArchiveTarget): string {
+    const candidates = this.getCurrentFolderSubfolderArchiveCandidates(target);
+    const existingMirrorCandidate = candidates.find((candidate) => this.isExistingFolderPath(candidate.parentPath));
+
+    return existingMirrorCandidate?.targetPath ?? candidates[0]?.targetPath ?? target.path;
+  }
+
+  getCurrentFolderSubfolderArchiveCandidates(target: ArchiveTarget): Array<{ targetPath: string; parentPath: string }> {
+    const archiveSubfolderName = this.getArchiveSubfolderName();
+    const pathParts = target.path.split("/").filter(Boolean);
+    const candidates: Array<{ targetPath: string; parentPath: string }> = [];
+
+    // Nearest to farthest: A/B/_archive/C, A/_archive/B/C, _archive/A/B/C.
+    for (let baseLength = pathParts.length - 1; baseLength >= 0; baseLength -= 1) {
+      const baseParts = pathParts.slice(0, baseLength);
+      const relativeParts = pathParts.slice(baseLength);
+      const candidateParts = [...baseParts, archiveSubfolderName, ...relativeParts];
+      const parentParts = candidateParts.slice(0, -1);
+
+      candidates.push({
+        targetPath: normalizePath(candidateParts.join("/")),
+        parentPath: normalizePath(parentParts.join("/")),
+      });
+    }
+
+    return candidates;
+  }
+
+  getRestoreTargetPath(target: ArchiveTarget): string | null {
+    if (this.settings.archiveLocation === ARCHIVE_LOCATIONS.CURRENT_FOLDER_SUBFOLDER) {
+      return this.getCurrentFolderSubfolderRestorePath(target);
+    }
+
+    const archiveFolderPath = this.getArchiveFolderPath();
+
+    if (!archiveFolderPath || !target.path.startsWith(`${archiveFolderPath}/`)) {
+      return null;
+    }
+
+    const restorePath = target.path.slice(archiveFolderPath.length + 1);
+    return restorePath ? normalizePath(restorePath) : null;
+  }
+
+  getCurrentFolderSubfolderRestorePath(target: ArchiveTarget): string | null {
+    const archiveSubfolderName = this.getArchiveSubfolderName();
+
+    if (!archiveSubfolderName) {
+      return null;
+    }
+
+    const pathParts = target.path.split("/");
+    const parentParts = pathParts.slice(0, -1);
+    const archiveFolderIndexes = parentParts
+      .map((part, index) => (part === archiveSubfolderName ? index : -1))
+      .filter((index) => index !== -1);
+
+    if (archiveFolderIndexes.length !== 1) {
+      return null;
+    }
+
+    const archiveFolderIndex = archiveFolderIndexes[0];
+    const restoreParts = [
+      ...parentParts.slice(0, archiveFolderIndex),
+      ...parentParts.slice(archiveFolderIndex + 1),
+      target.name,
+    ];
+    const restorePath = restoreParts.join("/");
+
+    return restorePath ? normalizePath(restorePath) : null;
+  }
+
+  isExistingFolderPath(path: string): boolean {
+    return this.app.vault.getAbstractFileByPath(path) instanceof TFolder;
   }
 
   getArchiveFolderPath(): string {

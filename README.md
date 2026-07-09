@@ -1,6 +1,6 @@
 # Mirror Archive Plugin for Obsidian
 
-Mirror Archive moves files and folders to a configurable archive location while preserving their original paths.
+Mirror Archive archives and restores files and folders while preserving their original paths.
 
 For example, if the archive folder path is `Archives`:
 
@@ -14,13 +14,27 @@ becomes:
 Archives/Projects/Client A/spec.pdf
 ```
 
+Run the same action on the archived item to restore it:
+
+```text
+Archives/Projects/Client A/spec.pdf
+```
+
+becomes:
+
+```text
+Projects/Client A/spec.pdf
+```
+
 ## Features
 
 - Archive the active file from the command palette.
+- Restore archived files and folders with the same command, hotkey, toolbar button, or context menu action.
 - Archive Markdown notes, PDFs, images, Office documents, and other files.
-- Archive selected files and folders from the file explorer context menu.
+- Archive or restore selected files and folders from the file explorer context menu.
 - Preserve the original path under a specified archive folder.
 - Or archive into a subfolder beside the original item.
+- Reuse an existing parent archive location when subfolder archiving can match one.
 - Automatically create intermediate folders.
 - Configurable conflict behavior when an archive target already exists.
 - Built-in language setting with English and Traditional Chinese.
@@ -34,24 +48,25 @@ You can archive into a subfolder next to the original item, or into one specifie
 
 ## Usage
 
-- Run `Mirror Archive` from the command palette to archive the active file.
-- Right-click a file or folder in the file explorer and choose `Mirror Archive`.
-- Select multiple items in the file explorer, right-click one of the selected items, and choose `Mirror Archive N selected items`.
+- Run `Mirror Archive` from the command palette to archive the active file, or restore it if it is already archived.
+- Right-click a file or folder in the file explorer and choose `Mirror Archive` or `Restore from Archive`.
+- Select multiple items in the file explorer, right-click one of the selected items, and choose the matching archive or restore action.
 - Assign a hotkey to the `Mirror Archive` command in Obsidian's hotkey settings.
+- Select only regular items or only archived items in one run. Mixed selections are ignored to avoid moving items in two directions at once.
 
 ## Settings
 
 - **Language**: Use the system language, English, or Traditional Chinese.
 - **Archive location**: Choose whether archived items stay near their original location or move into one specified folder.
-- **Subfolder name**: When archiving near the original location, create this subfolder inside the current folder.
+- **Subfolder name**: When archiving near the original location, create this subfolder inside the current folder. If a matching archive location already exists in a parent folder, the plugin reuses it.
 - **Archive folder path**: When archiving into a specified folder, use this folder as the starting point and preserve the original path under it. Existing folders are suggested, and new folder paths are allowed.
-- **Conflict behavior**: Choose how to handle archive target collisions.
-  - **Append sequence number**: Rename the archive target by appending a number, such as `note 1.md`.
-  - **Append timestamp**: Rename the archive target by appending a timestamp.
+- **Conflict behavior**: Choose how to handle collisions when archiving or restoring.
+  - **Append sequence number**: Rename the target by appending a number, such as `note 1.md`.
+  - **Append timestamp**: Rename the target by appending a timestamp.
   - **Skip existing target**: Leave the source item in place and skip it.
-  - **Stop on conflict**: Stop the current archive run when a collision is found.
+  - **Stop on conflict**: Stop the current run when a collision is found.
 - **Show left toolbar button**: Adds an archive button to the left toolbar.
-- **Add to context menu**: Adds archive actions to file, folder, and multi-selection context menus in the file explorer.
+- **Add to context menu**: Adds archive and restore actions to file, folder, and multi-selection context menus in the file explorer.
 
 Mirror Archive does not overwrite existing files or folders.
 
