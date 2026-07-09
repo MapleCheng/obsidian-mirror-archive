@@ -1,6 +1,6 @@
 {
   "name": "obsidian-mirror-archive",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Archive and restore selected files and folders while preserving their original paths.",
   "main": "dist/main.js",
   "scripts": {
