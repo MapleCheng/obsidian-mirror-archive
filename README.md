@@ -35,6 +35,8 @@ Projects/Client A/spec.pdf
 - Preserve the original path under a specified archive folder.
 - Or archive into a subfolder beside the original item.
 - Reuse an existing parent archive location when subfolder archiving can match one.
+- Route selected source folders to custom destinations before using the global archive fallback.
+- Choose per routing rule whether items at its destination restore or continue into the global archive.
 - Automatically create intermediate folders.
 - Configurable conflict behavior when an archive target already exists.
 - Built-in language setting with English and Traditional Chinese.
@@ -42,7 +44,7 @@ Projects/Client A/spec.pdf
 
 ## Setup
 
-After enabling the plugin, open the plugin settings and choose **Archive location**.
+After enabling the plugin, open the plugin settings and choose **Archive location**. This is the global fallback used whenever no routing rule matches.
 
 You can archive into a subfolder next to the original item, or into one specified folder while preserving the original path under it. The plugin does not choose a destination by default, which prevents accidental moves into an unexpected folder.
 
@@ -60,6 +62,12 @@ You can archive into a subfolder next to the original item, or into one specifie
 - **Archive location**: Choose whether archived items stay near their original location or move into one specified folder.
 - **Subfolder name**: When archiving near the original location, create this subfolder inside the current folder. If a matching archive location already exists in a parent folder, the plugin reuses it.
 - **Archive folder path**: When archiving into a specified folder, use this folder as the starting point and preserve the original path under it. Existing folders are suggested, and new folder paths are allowed.
+- **Routing rules**: Add ordered source-to-destination mappings that override the global fallback.
+  - Rules are checked from top to bottom, and the first matching source folder wins.
+  - Items keep their paths relative to the configured source folder under the destination folder.
+  - When **Allow restore** is enabled, running Mirror Archive at the rule destination moves the item back to the source.
+  - When **Allow restore** is disabled, running Mirror Archive at the rule destination skips all other routing rules and uses the global archive fallback directly.
+  - Source and destination folders must be different and cannot overlap.
 - **Conflict behavior**: Choose how to handle collisions when archiving or restoring.
   - **Append sequence number**: Rename the target by appending a number, such as `note 1.md`.
   - **Append timestamp**: Rename the target by appending a timestamp.

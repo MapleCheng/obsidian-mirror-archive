@@ -43,17 +43,26 @@ const ARCHIVE_LOCATIONS = {
 
 type ArchiveLocation = (typeof ARCHIVE_LOCATIONS)[keyof typeof ARCHIVE_LOCATIONS];
 
+interface ArchiveRule {
+  enabled: boolean;
+  sourceFolderPath: string;
+  destinationFolderPath: string;
+  allowRestore: boolean;
+}
+
 interface MirrorArchiveSettings {
   archiveLocation: ArchiveLocation;
   archiveSubfolderName: string;
   archiveFolderPath: string;
+  rules: ArchiveRule[];
   conflictBehavior: ConflictBehavior;
   language: LanguageSetting;
   showRibbonIcon: boolean;
   showFileMenuItem: boolean;
 }
 
-type RawMirrorArchiveSettings = Partial<MirrorArchiveSettings> & {
+type RawMirrorArchiveSettings = Partial<Omit<MirrorArchiveSettings, "rules">> & {
+  rules?: unknown;
   archiveRoot?: string;
   allowFolderArchive?: boolean;
   useFileExplorerSelectionForHotkey?: boolean;
@@ -96,6 +105,7 @@ const DEFAULT_SETTINGS: MirrorArchiveSettings = {
   archiveLocation: ARCHIVE_LOCATIONS.SPECIFIED_FOLDER,
   archiveSubfolderName: "",
   archiveFolderPath: "",
+  rules: [],
   conflictBehavior: CONFLICT_BEHAVIORS.SEQUENCE,
   language: LANGUAGE_OPTIONS.SYSTEM,
   showRibbonIcon: true,
@@ -146,6 +156,7 @@ export default class MirrorArchivePlugin extends Plugin {
         loadedData.archiveSubfolderName ?? DEFAULT_SETTINGS.archiveSubfolderName
       ),
       archiveFolderPath: this.normalizeArchiveFolderPath(archiveFolderPath),
+      rules: this.normalizeArchiveRules(loadedData.rules),
       conflictBehavior: isConflictBehavior(loadedData.conflictBehavior)
         ? loadedData.conflictBehavior
         : DEFAULT_SETTINGS.conflictBehavior,
@@ -201,6 +212,12 @@ export default class MirrorArchivePlugin extends Plugin {
   async handleTargets(targets: unknown[]): Promise<void> {
     if (!this.hasArchiveDestination()) {
       this.showMissingArchiveDestinationNotice();
+      return;
+    }
+
+    const invalidRuleIndex = this.getInvalidRuleIndexForTargets(targets);
+    if (invalidRuleIndex !== null) {
+      new Notice(this.t("notice.invalidRule", { index: invalidRuleIndex + 1 }));
       return;
     }
 
@@ -604,7 +621,7 @@ export default class MirrorArchivePlugin extends Plugin {
 
   canArchive(target: unknown): target is ArchiveTarget {
     const isArchiveableType = target instanceof TFile || target instanceof TFolder;
-    return isArchiveableType && Boolean(target.path) && !this.isArchived(target);
+    return isArchiveableType && Boolean(target.path) && !this.isGloballyArchived(target) && !this.canRestore(target);
   }
 
   canRestore(target: unknown): target is ArchiveTarget {
@@ -615,7 +632,48 @@ export default class MirrorArchivePlugin extends Plugin {
     return childPath.startsWith(`${parentPath}/`);
   }
 
-  isArchived(target: ArchiveTarget): boolean {
+  isSameOrDescendantPath(path: string, folderPath: string): boolean {
+    return Boolean(folderPath) && (path === folderPath || path.startsWith(`${folderPath}/`));
+  }
+
+  isArchiveRuleValid(rule: ArchiveRule): boolean {
+    const sourceFolderPath = this.normalizeArchiveFolderPath(rule.sourceFolderPath);
+    const destinationFolderPath = this.normalizeArchiveFolderPath(rule.destinationFolderPath);
+
+    if (!sourceFolderPath || !destinationFolderPath || sourceFolderPath === destinationFolderPath) {
+      return false;
+    }
+
+    return (
+      !this.isAncestorPath(sourceFolderPath, destinationFolderPath) &&
+      !this.isAncestorPath(destinationFolderPath, sourceFolderPath)
+    );
+  }
+
+  getInvalidRuleIndexForTargets(targets: unknown[]): number | null {
+    const targetPaths = targets
+      .filter((target): target is ArchiveTarget => target instanceof TFile || target instanceof TFolder)
+      .map((target) => target.path);
+
+    const invalidRuleIndex = this.settings.rules.findIndex((rule) => {
+      if (!rule.enabled || this.isArchiveRuleValid(rule)) {
+        return false;
+      }
+
+      const sourceFolderPath = this.normalizeArchiveFolderPath(rule.sourceFolderPath);
+      const destinationFolderPath = this.normalizeArchiveFolderPath(rule.destinationFolderPath);
+
+      return targetPaths.some(
+        (path) =>
+          this.isSameOrDescendantPath(path, sourceFolderPath) ||
+          this.isSameOrDescendantPath(path, destinationFolderPath)
+      );
+    });
+
+    return invalidRuleIndex === -1 ? null : invalidRuleIndex;
+  }
+
+  isGloballyArchived(target: ArchiveTarget): boolean {
     if (this.settings.archiveLocation === ARCHIVE_LOCATIONS.CURRENT_FOLDER_SUBFOLDER) {
       const archiveSubfolderName = this.getArchiveSubfolderName();
       if (!archiveSubfolderName) return false;
@@ -741,6 +799,24 @@ export default class MirrorArchivePlugin extends Plugin {
   }
 
   getArchiveTargetPath(target: ArchiveTarget): string {
+    const destinationRule = this.getMatchingDestinationRule(target.path);
+    if (destinationRule) {
+      return this.getGlobalArchiveTargetPath(target);
+    }
+
+    const sourceRule = this.getMatchingSourceRule(target.path);
+    if (sourceRule) {
+      return this.mapRulePath(
+        target.path,
+        sourceRule.sourceFolderPath,
+        sourceRule.destinationFolderPath
+      );
+    }
+
+    return this.getGlobalArchiveTargetPath(target);
+  }
+
+  getGlobalArchiveTargetPath(target: ArchiveTarget): string {
     if (this.settings.archiveLocation === ARCHIVE_LOCATIONS.CURRENT_FOLDER_SUBFOLDER) {
       return this.getCurrentFolderSubfolderArchivePath(target);
     }
@@ -777,6 +853,28 @@ export default class MirrorArchivePlugin extends Plugin {
   }
 
   getRestoreTargetPath(target: ArchiveTarget): string | null {
+    const globalRestorePath = this.getGlobalRestoreTargetPath(target);
+    if (globalRestorePath) {
+      return globalRestorePath;
+    }
+
+    const destinationRule = this.getMatchingDestinationRule(target.path);
+    if (destinationRule) {
+      if (!destinationRule.allowRestore) {
+        return null;
+      }
+
+      return this.mapRulePath(
+        target.path,
+        destinationRule.destinationFolderPath,
+        destinationRule.sourceFolderPath
+      );
+    }
+
+    return null;
+  }
+
+  getGlobalRestoreTargetPath(target: ArchiveTarget): string | null {
     if (this.settings.archiveLocation === ARCHIVE_LOCATIONS.CURRENT_FOLDER_SUBFOLDER) {
       return this.getCurrentFolderSubfolderRestorePath(target);
     }
@@ -789,6 +887,38 @@ export default class MirrorArchivePlugin extends Plugin {
 
     const restorePath = target.path.slice(archiveFolderPath.length + 1);
     return restorePath ? normalizePath(restorePath) : null;
+  }
+
+  getActiveArchiveRules(): ArchiveRule[] {
+    return this.settings.rules.filter((rule) => rule.enabled && this.isArchiveRuleValid(rule));
+  }
+
+  getMatchingSourceRule(path: string): ArchiveRule | null {
+    return (
+      this.getActiveArchiveRules().find((rule) =>
+        this.isSameOrDescendantPath(path, this.normalizeArchiveFolderPath(rule.sourceFolderPath))
+      ) ?? null
+    );
+  }
+
+  getMatchingDestinationRule(path: string): ArchiveRule | null {
+    return (
+      this.getActiveArchiveRules().find((rule) =>
+        this.isSameOrDescendantPath(path, this.normalizeArchiveFolderPath(rule.destinationFolderPath))
+      ) ?? null
+    );
+  }
+
+  mapRulePath(path: string, sourceFolderPath: string, destinationFolderPath: string): string {
+    const normalizedSource = this.normalizeArchiveFolderPath(sourceFolderPath);
+    const normalizedDestination = this.normalizeArchiveFolderPath(destinationFolderPath);
+
+    if (path === normalizedSource) {
+      return normalizedDestination;
+    }
+
+    const relativePath = path.slice(normalizedSource.length + 1);
+    return normalizePath(`${normalizedDestination}/${relativePath}`);
   }
 
   getCurrentFolderSubfolderRestorePath(target: ArchiveTarget): string | null {
@@ -857,6 +987,39 @@ export default class MirrorArchivePlugin extends Plugin {
     }
 
     return normalized.replace(/^\/+/, "").replace(/\/+$/, "");
+  }
+
+  normalizeArchiveRules(value: unknown): ArchiveRule[] {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+
+    const rules: ArchiveRule[] = [];
+
+    for (const rawRule of value) {
+      if (!rawRule || typeof rawRule !== "object") {
+        continue;
+      }
+
+      const rule = rawRule as Partial<ArchiveRule>;
+      rules.push({
+        enabled: rule.enabled === true,
+        sourceFolderPath: this.normalizeArchiveFolderPath(rule.sourceFolderPath),
+        destinationFolderPath: this.normalizeArchiveFolderPath(rule.destinationFolderPath),
+        allowRestore: rule.allowRestore !== false,
+      });
+    }
+
+    return rules;
+  }
+
+  createArchiveRule(): ArchiveRule {
+    return {
+      enabled: false,
+      sourceFolderPath: "",
+      destinationFolderPath: "",
+      allowRestore: true,
+    };
   }
 
   normalizeArchiveSubfolderName(value: unknown): string {
@@ -998,6 +1161,130 @@ class MirrorArchiveSettingTab extends PluginSettingTab {
         });
     }
 
+    const renderRules = (): void => {
+      new Setting(containerEl)
+        .setName(t("settings.rules.name"))
+        .setDesc(t("settings.rules.desc"))
+        .setHeading()
+        .addButton((button) =>
+          button.setButtonText(t("settings.rules.add")).onClick(async () => {
+            this.plugin.settings.rules.push(this.plugin.createArchiveRule());
+            await this.plugin.saveSettings();
+            this.display();
+          })
+        );
+
+      if (this.plugin.settings.rules.length === 0) {
+        new Setting(containerEl).setDesc(t("settings.rules.empty"));
+      }
+
+      this.plugin.settings.rules.forEach((rule, index) => {
+        const sourceLabel = rule.sourceFolderPath || t("settings.rules.unset");
+        const destinationLabel = rule.destinationFolderPath || t("settings.rules.unset");
+        const ruleSetting = new Setting(containerEl)
+          .setName(t("settings.rules.ruleName", { index: index + 1 }))
+          .setDesc(t("settings.rules.summary", { source: sourceLabel, destination: destinationLabel }))
+          .addToggle((toggle) =>
+            toggle.setValue(rule.enabled).onChange(async (value) => {
+              if (value && !this.plugin.isArchiveRuleValid(rule)) {
+                toggle.setValue(false);
+                new Notice(t("notice.invalidRule", { index: index + 1 }));
+                return;
+              }
+
+              rule.enabled = value;
+              await this.plugin.saveSettings();
+            })
+          );
+
+        ruleSetting
+          .addExtraButton((button) =>
+            button
+              .setIcon("arrow-up")
+              .setTooltip(t("settings.rules.moveUp"))
+              .setDisabled(index === 0)
+              .onClick(async () => {
+                const [movedRule] = this.plugin.settings.rules.splice(index, 1);
+                this.plugin.settings.rules.splice(index - 1, 0, movedRule);
+                await this.plugin.saveSettings();
+                this.display();
+              })
+          )
+          .addExtraButton((button) =>
+            button
+              .setIcon("arrow-down")
+              .setTooltip(t("settings.rules.moveDown"))
+              .setDisabled(index === this.plugin.settings.rules.length - 1)
+              .onClick(async () => {
+                const [movedRule] = this.plugin.settings.rules.splice(index, 1);
+                this.plugin.settings.rules.splice(index + 1, 0, movedRule);
+                await this.plugin.saveSettings();
+                this.display();
+              })
+          )
+          .addExtraButton((button) =>
+            button
+              .setIcon("trash-2")
+              .setTooltip(t("settings.rules.remove"))
+              .onClick(async () => {
+                this.plugin.settings.rules.splice(index, 1);
+                await this.plugin.saveSettings();
+                this.display();
+              })
+          );
+
+        new Setting(containerEl)
+          .setName(t("settings.rules.source.name"))
+          .setDesc(t("settings.rules.source.desc"))
+          .addText((text) => {
+            text
+              .setPlaceholder(t("settings.rules.source.placeholder"))
+              .setValue(rule.sourceFolderPath)
+              .onChange(async (value) => {
+                rule.sourceFolderPath = this.plugin.normalizeArchiveFolderPath(value);
+                await this.plugin.saveSettings();
+              });
+
+            new FolderSuggest(this.app, text.inputEl, async (folderPath) => {
+              rule.sourceFolderPath = this.plugin.normalizeArchiveFolderPath(folderPath);
+              text.setValue(rule.sourceFolderPath);
+              await this.plugin.saveSettings();
+              this.display();
+            });
+          });
+
+        new Setting(containerEl)
+          .setName(t("settings.rules.destination.name"))
+          .setDesc(t("settings.rules.destination.desc"))
+          .addText((text) => {
+            text
+              .setPlaceholder(t("settings.rules.destination.placeholder"))
+              .setValue(rule.destinationFolderPath)
+              .onChange(async (value) => {
+                rule.destinationFolderPath = this.plugin.normalizeArchiveFolderPath(value);
+                await this.plugin.saveSettings();
+              });
+
+            new FolderSuggest(this.app, text.inputEl, async (folderPath) => {
+              rule.destinationFolderPath = this.plugin.normalizeArchiveFolderPath(folderPath);
+              text.setValue(rule.destinationFolderPath);
+              await this.plugin.saveSettings();
+              this.display();
+            });
+          });
+
+        new Setting(containerEl)
+          .setName(t("settings.rules.restore.name"))
+          .setDesc(t("settings.rules.restore.desc"))
+          .addToggle((toggle) =>
+            toggle.setValue(rule.allowRestore).onChange(async (value) => {
+              rule.allowRestore = value;
+              await this.plugin.saveSettings();
+            })
+          );
+      });
+    };
+
     new Setting(containerEl)
       .setName(t("settings.conflict.name"))
       .setDesc(t("settings.conflict.desc"))
@@ -1034,6 +1321,8 @@ class MirrorArchiveSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
+
+    renderRules();
   }
 }
 
